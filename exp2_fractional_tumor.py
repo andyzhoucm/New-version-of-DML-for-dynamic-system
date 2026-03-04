@@ -8,6 +8,7 @@ from sklearn.model_selection import KFold
 from joblib import Parallel, delayed
 import scipy.stats as stats
 from scipy.interpolate import UnivariateSpline, CubicSpline
+from scipy.interpolate import LSQUnivariateSpline
 from scipy.integrate import simpson, solve_ivp
 import time
 import warnings
@@ -121,14 +122,13 @@ def generate_tumor_data(N=100, T=40, dt=0.5, seed=None):
 # 3. Topology 1 DML 算法本体
 # ==========================================
 class TumorIntegralDML:
-    def __init__(self, dt, sigma_sq_hat, micro_steps=10):
+    def __init__(self, dt, micro_steps=10):
         self.dt = dt
         self.micro_steps = micro_steps
         self.dt_micro = dt / micro_steps
-        self.sigma_sq_hat = sigma_sq_hat  # 接收底噪
         self.engine = TumorPhysicsEngine()
 
-    def fit(self, Y, D, Z, max_iter=15, tol=1e-4):
+    def fit(self, Y, D, Z, max_iter=15, tol=1e-10):
         N_subj, T_plus_1, Dim = Y.shape
         T_pts = T_plus_1 - 1
         P_dim = 2
@@ -141,15 +141,18 @@ class TumorIntegralDML:
         Z_next = np.float32(Z[:, 1:, :].reshape(-1, 1))
         Features_ML = np.hstack([Z_curr, Z_next])
         
-        # 🚀【Topology I 核心】：因为有 Y^(2/3)，必须用 UnivariateSpline 彻底干掉噪音！
         T_eval = np.arange(T_plus_1) * self.dt
         T_dense = np.linspace(0, T_pts * self.dt, T_pts * self.micro_steps + 1)
         
         Y_dense = np.zeros((N_subj, len(T_dense), Dim))
+        
+        K_knots = 10  # 硬性规定 10 个内部节点 (保证 K << M，绝对不会插值！)
+        # 均匀生成内部节点 (必须严格在起点和终点之内)
+        interior_knots = np.linspace(T_eval[1], T_eval[-2], K_knots)
+
         for i in range(N_subj):
-            # 🚀 极其关键：利用动态榨取出的底噪方差，制定理论最优惩罚边界！
-            optimal_s = T_plus_1 * self.sigma_sq_hat
-            smoother = UnivariateSpline(T_eval, Y[i, :, 0], s=optimal_s) 
+            # 直接跑 OLS 样条回归，完全不需要 sigma_sq_hat！
+            smoother = LSQUnivariateSpline(T_eval, Y[i, :, 0], t=interior_knots) 
             Y_dense[i, :, 0] = np.maximum(smoother(T_dense), 0.01)
                 
         cs_D = CubicSpline(T_eval, D[:, :, 0], axis=1)
@@ -201,17 +204,26 @@ class TumorIntegralDML:
             G_tilde = J_int_flat.reshape(-1, Dim, P_dim) - J_hat.reshape(-1, Dim, P_dim)
 
             A_sys = G_tilde.reshape(-1, P_dim)       
-            b_sys = eps_tilde.reshape(-1)         
+            b_sys = eps_tilde.reshape(-1)        
+            
+            # 🌟 【理论对齐核心修改】计算当前 theta_est 下的经验得分函数 (Empirical Score)
+            # 对应公式: \Psi_M = (1 / NT) * \sum \tilde{G}_{i,j}^T \tilde{\epsilon}_{i,j}
+            empirical_score = (A_sys.T @ b_sys) / (N_subj * T_pts)
             
             delta_theta = np.linalg.pinv(A_sys.T @ A_sys) @ (A_sys.T @ b_sys)
-            theta_est = np.maximum(theta_est + delta_theta, 0.05)
             
             final_G_tilde = G_tilde
             final_eps_tilde = eps_tilde.reshape(-1, Dim) - np.einsum('ijk,k->ij', G_tilde.reshape(-1, Dim, P_dim), delta_theta)
             final_eps_tilde = final_eps_tilde.reshape(N_subj, T_pts, Dim)
 
-            if np.max(np.abs(delta_theta)) < tol:
+
+            print(f"Iteration {k+1}: Theta = {theta_est}, Empirical Score = {empirical_score}, Delta Theta = {delta_theta}")
+
+            # 🌟 【终止条件修改】当经验得分函数的最大绝对值充分趋近于 0 时终止
+            if np.max(np.abs(empirical_score)) < tol:
                 break
+            
+            theta_est = np.maximum(theta_est + delta_theta, 0.05)
 
         # --- 三明治方差推断 ---
         G_tilde_subj = final_G_tilde.reshape(N_subj, T_pts, Dim, P_dim)
@@ -242,16 +254,11 @@ class TumorIntegralDML:
 def run_validation(seed):
     print(f"Seed {seed}: Starting data generation...")
     dt = 0.01
-    Y, D, Z, true_theta = generate_tumor_data(N=2000, T=50, dt=dt, seed=seed)
+    Y, D, Z, true_theta = generate_tumor_data(N=1000, T=50, dt=dt, seed=seed)
     print(f"Seed {seed}: Data generated complete. Starting DML fitting...")
-    
-    # 动态榨取真实底噪！
-    estimated_sigma_sq = estimate_noise_variance(Y)
-
-    print(f"Seed {seed}: Estimated Noise Variance = {estimated_sigma_sq:.6f}")
-    
+   
     # 传入 DML 引擎
-    dml = TumorIntegralDML(dt=dt, sigma_sq_hat=estimated_sigma_sq)
+    dml = TumorIntegralDML(dt=dt)
     est_theta, se = dml.fit(Y, D, Z) 
     
     t_stats = (est_theta - true_theta) / se
@@ -260,13 +267,13 @@ def run_validation(seed):
     return est_theta, se, t_stats
 
 if __name__ == "__main__":
-    N_SIMS = 50  
+    N_SIMS = 1000  
     TRUE_THETA = [1.2, 0.8]
     
     print(f"🚀 Running TOPOLOGY I (Fractional Tumor Growth) Validation...")
     start_time = time.time()
     
-    results = Parallel(n_jobs=8, verbose=5)(
+    results = Parallel(n_jobs=16, verbose=5)(
         delayed(run_validation)(seed=i) for i in range(N_SIMS)
     )
     
@@ -300,7 +307,7 @@ if __name__ == "__main__":
         plt.xlabel("T-statistic")
         plt.legend()
         plt.grid(True, alpha=0.3)
-        
+    
     plt.tight_layout()
     plt.show()
 
@@ -309,7 +316,7 @@ if __name__ == "__main__":
     ============================================================
     Param    True   Mean Est   Mean SE    Emp SD     Coverage  
     ------------------------------------------------------------
-    Growth_T1 1.2    1.1998     0.0019     0.0013     98.00%    
-    Effect_T2 0.8    0.8001     0.0004     0.0004     98.00%    
+    Growth_T1 1.2    1.2001     0.0026     0.0026     96.00%    
+    Effect_T2 0.8    0.8000     0.0006     0.0006     94.50%    
     ============================================================
     """
