@@ -8,22 +8,12 @@ from sklearn.model_selection import KFold
 from joblib import Parallel, delayed
 import scipy.stats as stats
 from scipy.optimize import least_squares
-from scipy.interpolate import CubicSpline, UnivariateSpline
+from scipy.interpolate import CubicSpline, LSQUnivariateSpline
 from scipy.integrate import simpson, solve_ivp
 import time
 import warnings
 import gc
 warnings.filterwarnings("ignore")
-
-# ==========================================
-# 0. 魔法工具：无模型底噪提取器
-# ==========================================
-def estimate_noise_variance(Y_obs):
-    """利用二阶差分从连续轨迹中提取测量白噪音的方差
-       提取出的方差将被用于指导样条平滑的最佳惩罚力度
-    """
-    diff2 = Y_obs[:, 2:, :] - 2 * Y_obs[:, 1:-1, :] + Y_obs[:, :-2, :]
-    return np.mean(diff2**2) / 6.0
 
 # ==========================================
 # 1. 物理引擎 (极简原生代数形态，无需泰勒校正)
@@ -55,7 +45,7 @@ class AlgebraicPhysicsEngine:
         return grad_theta
 
 # ==========================================
-# 2. 数据生成 (上帝视角连续宇宙 + 观测噪音)
+# 2. 数据生成
 # ==========================================
 def generate_coupled_data(N=1000, T=30, dt=0.05, seed=None):
     if seed is not None: np.random.seed(seed)
@@ -108,15 +98,15 @@ def generate_coupled_data(N=1000, T=30, dt=0.05, seed=None):
     return np.array(Y_list), np.array(D_list), np.array(Z_list), true_theta
 
 # ==========================================
-# 3. 终极大一统 DML: 物理平滑去噪 + 辛普森高精 + 样条学习
+# 3. Integral DML 实现
 # ==========================================
+
 class UltimateIntegralDML:
-    def __init__(self, dt, sigma_sq_hat, micro_steps=10):
+    def __init__(self, dt, micro_steps=10):
         self.dt = dt
         self.micro_steps = micro_steps
         self.dt_micro = dt / micro_steps
-        self.sigma_sq_hat = sigma_sq_hat # 作为平滑力度参数
-        self.engine = AlgebraicPhysicsEngine() # 纯净引擎
+        self.engine = AlgebraicPhysicsEngine()
 
     def _compute_high_precision_integrals(self, Y_dense, D_dense, theta, N_subj, T_pts):
         Dim = Y_dense.shape[-1]
@@ -150,7 +140,7 @@ class UltimateIntegralDML:
         res = least_squares(objective, x0=np.array([5.0, 5.0, 5.0]), bounds=(0.01, np.inf))
         return res.x
 
-    def fit(self, Y, D, Z, max_iter=20, tol=1e-4):
+    def fit(self, Y, D, Z, max_iter=20, tol=1e-10):
         N_subj, T_plus_1, Dim = Y.shape
         T_pts = T_plus_1 - 1
         
@@ -162,18 +152,21 @@ class UltimateIntegralDML:
         Z_next = np.float32(Z[:, 1:].reshape(-1, 1))
         Features_ML = np.hstack([Z_curr, Z_next])
         
-        # 🚀 极其关键：利用 UnivariateSpline 消除测量噪音，利用 CubicSpline 完美插值驱动力
+        # LSQUnivariateSpline 彻底干掉噪音，利用 CubicSpline 完美插值驱动力
         T_eval = np.arange(T_plus_1) * self.dt
         T_dense = np.linspace(0, T_pts * self.dt, T_pts * self.micro_steps + 1)
         
         Y_dense = np.zeros((N_subj, len(T_dense), Dim), dtype=np.float32)
+        
+        K_knots = 10  # 硬性规定 10 个内部节点 (保证 K << M，对应于黄理论中的截断)
+        # 均匀生成内部节点 (必须严格在起点和终点之内)
+        interior_knots = np.linspace(T_eval[1], T_eval[-2], K_knots)
+        
         for i in range(N_subj):
             for d in range(Dim):
-                # 利用榨取出的噪音方差，动态设定最优平滑惩罚项 s
-                smoother = UnivariateSpline(T_eval, Y[i, :, d], s=T_plus_1 * self.sigma_sq_hat)
-                Y_dense[i, :, d] = smoother(T_dense)
+                smoother = LSQUnivariateSpline(T_eval, Y[i, :, d], t=interior_knots)
+                Y_dense[i, :, d] = np.maximum(smoother(T_dense), 0.01)
                 
-        # D 没有测量噪音，直接高精度三次样条无损插值
         cs_D = CubicSpline(T_eval, D, axis=1)
         D_dense = np.float32(cs_D(T_dense))
         
@@ -196,7 +189,6 @@ class UltimateIntegralDML:
             J_hat = np.zeros_like(Target_J)
 
             for tr_mask, va_mask in cv_masks:
-                # 砸碎阶梯树模型，使用无限光滑的 Spline + Ridge！
                 for d in range(Dim):
                     model_R = make_pipeline(SplineTransformer(n_knots=15, degree=3), Ridge(alpha=1e-5))
                     model_R.fit(Features_ML[tr_mask], Target_R[tr_mask, d])
@@ -213,11 +205,14 @@ class UltimateIntegralDML:
             A_sys = G_tilde.reshape(-1, Dim)      
             b_sys = eps_tilde.reshape(-1)         
             
-            ATA = A_sys.T @ A_sys                 
-            ATb = A_sys.T @ b_sys                 
+            ATA = A_sys.T @ A_sys                
+            ATb = A_sys.T @ b_sys                
+            
+            # 计算当前 theta_est 下的经验得分函数 (Empirical Score)
+            # 对应公式: \Psi_M = (1 / NT) * \sum \tilde{G}_{i,j}^T \tilde{\epsilon}_{i,j}
+            empirical_score = ATb / (N_subj * T_pts)
             
             delta_theta = np.linalg.pinv(ATA) @ ATb
-            new_theta = np.maximum(theta_est + delta_theta, 0.01)
             
             final_G_tilde = G_tilde
             G_flat_final = G_tilde.reshape(-1, Dim, Dim)
@@ -225,14 +220,17 @@ class UltimateIntegralDML:
             e_flat_corrected = eps_tilde.reshape(-1, Dim) - correction
             final_eps_tilde = e_flat_corrected.reshape(N_subj, T_pts, Dim)
             
-            theta_est = np.copy(new_theta)
+            print(f"Iteration {k+1}: Theta = {theta_est}, Empirical Score = {empirical_score}, Delta Theta = {delta_theta}")
 
-            print(f"Iter {k+1}/{max_iter} - Theta: {theta_est.round(5)} - Max Abs Delta: {np.max(np.abs(delta_theta)):.6f}")
-            if np.max(np.abs(delta_theta)) < tol:
+            # 当经验得分函数的最大绝对值充分趋近于 0 时终止
+            if np.max(np.abs(empirical_score)) < tol:
                 break
+                
+            # 保证参数的物理非负性下界
+            theta_est = np.maximum(theta_est + delta_theta, 0.01)
 
         # --- 三明治方差计算 ---
-        G_tilde_subj = final_G_tilde.reshape(N_subj, T_pts, Dim, Dim)
+        G_tilde_subj = final_G_tilde.reshape(N_subj, T_pts, Dim, Dim)   # type: ignore
         eps_tilde_subj = final_eps_tilde 
         
         J_sum = np.zeros((Dim, Dim))
@@ -240,7 +238,7 @@ class UltimateIntegralDML:
         
         for i in range(N_subj):
             G_i = G_tilde_subj[i]       
-            e_i = eps_tilde_subj[i]     
+            e_i = eps_tilde_subj[i] # type: ignore 
             G_i_flat = G_i.reshape(-1, Dim) 
             J_sum += G_i_flat.T @ G_i_flat
             
@@ -261,43 +259,37 @@ class UltimateIntegralDML:
         SE = np.sqrt(np.diag(Var_hat))
         
         return theta_est, SE
-
 # ==========================================
 # 4. 验证实验流水线
 # ==========================================
 def run_validation(seed):
-    # N=2000, T=50，保持充足的时间跨度和维度以消灭插值误差和周期边界效应
     dt = 0.01
-    Y, D, Z, true_theta = generate_coupled_data(N=2000, T=50, dt=dt, seed=seed)
+    Y, D, Z, true_theta = generate_coupled_data(N=1000, T=50, dt=dt, seed=seed)
+
     
-    # 动态榨取数据中的真实底噪，提供物理去噪平滑力度
-    estimated_sigma_sq = estimate_noise_variance(Y)
-    
-    dml = UltimateIntegralDML(dt=dt, sigma_sq_hat=estimated_sigma_sq)
-    est_theta, se = dml.fit(Y, D, Z, max_iter=20, tol=1e-4) 
+    dml = UltimateIntegralDML(dt=dt)
+    est_theta, se = dml.fit(Y, D, Z, max_iter=20, tol=1e-10) 
     
     t_stats = (est_theta - true_theta) / se
-    return est_theta, se, t_stats, estimated_sigma_sq
+    return est_theta, se, t_stats
 
 if __name__ == "__main__":
-    N_SIMS = 10  
+    N_SIMS = 1000  
     TRUE_THETA = [0.5, 1.0, 1.5]
     
     print(f"🚀 Running Ultimate Coupled DML Validation ({N_SIMS} Sims)...")
     start_time = time.time()
     
     # 注意控制 n_jobs，防止高精网格干爆内存
-    results = Parallel(n_jobs=4, verbose=5)(
+    results = Parallel(n_jobs=16, verbose=5)(
         delayed(run_validation)(seed=i) for i in range(N_SIMS)
     )
     
-    ests = np.array([r[0] for r in results])    
-    ses = np.array([r[1] for r in results])     
-    t_stats = np.array([r[2] for r in results]) 
-    sigmas = np.array([r[3] for r in results])
+    ests = np.array([r[0] for r in results])   # type: ignore 
+    ses = np.array([r[1] for r in results]) # type: ignore 
+    t_stats = np.array([r[2] for r in results]) # type: ignore 
     
     print(f"\nDone in {time.time() - start_time:.2f} seconds.")
-    print(f"💡 [无监督榨取诊断] 平均提取底噪方差 = {np.mean(sigmas):.7f} (真实设定为 0.000025)")
     
     print("\n" + "="*60)
     print(f"{'Param':<8} {'True':<6} {'Mean Est':<10} {'Mean SE':<10} {'Emp SD':<10} {'Coverage':<10}")
@@ -324,8 +316,10 @@ if __name__ == "__main__":
         
         plt.title(f"T-stats for Theta_{i+1}\nTrue={TRUE_THETA[i]}")
         plt.xlabel("(Est - True) / SE")
-        if i == 0: plt.ylabel("Density")
-        else: plt.ylabel("") 
+        if i == 0:
+            plt.ylabel("Density")
+        else:
+            plt.ylabel("") 
             
         plt.legend()
         plt.grid(True, alpha=0.3)
@@ -348,3 +342,14 @@ if __name__ == "__main__":
     
     plt.tight_layout()
     plt.show()
+
+
+"""
+============================================================
+Param    True   Mean Est   Mean SE    Emp SD     Coverage  
+------------------------------------------------------------
+Theta_1  0.5    0.5001     0.0020     0.0021     94.90%    
+Theta_2  1.0    1.0003     0.0034     0.0036     93.70%    
+Theta_3  1.5    1.4999     0.0049     0.0051     93.20%    
+============================================================
+"""
