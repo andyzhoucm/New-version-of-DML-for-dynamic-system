@@ -7,7 +7,7 @@ from sklearn.linear_model import Ridge
 from sklearn.model_selection import KFold
 from joblib import Parallel, delayed
 import scipy.stats as stats
-from scipy.interpolate import UnivariateSpline, CubicSpline
+from scipy.interpolate import CubicSpline, LSQUnivariateSpline
 from scipy.integrate import simpson, solve_ivp
 import time
 import warnings
@@ -122,7 +122,7 @@ class UltimateTopology1_DML:
             
         return F_int.reshape(-1, Dim), J_int.reshape(-1, Dim * P_dim)
 
-    def fit(self, Y, Z, max_iter=20, tol=1e-4):
+    def fit(self, Y, Z, max_iter=20, tol=1e-10):
         N_subj, T_plus_1, Dim = Y.shape
         T_pts = T_plus_1 - 1
         P_dim = 2
@@ -147,11 +147,14 @@ class UltimateTopology1_DML:
 
         Y_dense = np.zeros((N_subj, len(T_dense), Dim), dtype=np.float32)
         
-        # 完美 UnivariateSpline 物理去噪
+        # 🚀【理论升级】改用 Fixed-knot Regression Spline (LSQUnivariateSpline)
+        K_knots = 10  # 严格匹配理论中的固定节点截断假设
+        interior_knots = np.linspace(T_eval[1], T_eval[-2], K_knots)
+        
         for i in range(N_subj):
             for d in range(Dim):
-                penalty = T_plus_1 * self.sigma_sq_hat * self.penalty_factor
-                smoother = UnivariateSpline(T_eval, Y[i, :, d], s=penalty)
+                # 严格服从指令：去掉 np.maximum，维持绝对零均值
+                smoother = LSQUnivariateSpline(T_eval, Y[i, :, d], t=interior_knots)
                 Y_dense[i, :, d] = smoother(T_dense)
                 
         self.Y_dense_save = Y_dense.copy() # 供画图使用
@@ -199,16 +202,24 @@ class UltimateTopology1_DML:
             A_sys = G_tilde.reshape(-1, P_dim)       
             b_sys = eps_tilde.reshape(-1)         
             
-            delta_theta = np.linalg.pinv(A_sys.T @ A_sys) @ (A_sys.T @ b_sys)
+            ATA = A_sys.T @ A_sys                
+            ATb = A_sys.T @ b_sys  
+            
+            # 🌟 【理论对齐核心修改】计算当前 theta_est 下的经验得分函数 (Empirical Score)
+            empirical_score = ATb / (N_subj * T_pts)
+            
+            delta_theta = np.linalg.pinv(ATA) @ ATb
             theta_est = np.maximum(theta_est + delta_theta, 0.01) # 防止发散
             
             final_G_tilde = G_tilde
             final_eps_tilde = eps_tilde.reshape(-1, Dim) - np.einsum('ijk,k->ij', G_tilde.reshape(-1, Dim, P_dim), delta_theta)
             final_eps_tilde = final_eps_tilde.reshape(N_subj, T_pts, Dim)
 
-            print(f"Iter {k+1}: Theta={theta_est}, Delta={delta_theta}, Norm Delta={np.linalg.norm(delta_theta):.6f}")
+            score_norm = np.max(np.abs(empirical_score))
+            print(f"Iter {k+1}: Theta={theta_est.round(5)}, Max Abs Score={score_norm:.6e}")
 
-            if np.max(np.abs(delta_theta)) < tol:
+            # 🌟 【终止条件修改】当经验得分函数的最大绝对值充分趋近于 0 时终止
+            if score_norm < tol:
                 break
 
         # --- 完美三明治方差推断 ---
@@ -237,7 +248,7 @@ class UltimateTopology1_DML:
 def run_validation(seed, penalty_factor):
     dt = 0.01
     T = 40
-    Y, Y_true, Z, true_theta = generate_sir_data(N=100, T=T, dt=dt, seed=seed)
+    Y, Y_true, Z, true_theta = generate_sir_data(N=1000, T=T, dt=dt, seed=seed)
     
     # 无监督提取原始数据底噪
     estimated_sigma_sq = estimate_noise_variance(Y)
@@ -259,14 +270,14 @@ def run_validation(seed, penalty_factor):
     return est_theta, se, t_stats, sample_traj
 
 if __name__ == "__main__":
-    N_SIMS = 100  
+    N_SIMS = 1000  
     TRUE_THETA = [2.5, 1.0]
     PENALTY_FACTOR = 1.0 
     
     print(f"🚀 Running ULTIMATE DML SIR Validation ({N_SIMS} Sims)...")
     start_time = time.time()
     
-    results = Parallel(n_jobs=4, verbose=5)(
+    results = Parallel(n_jobs=16, verbose=5)(
         delayed(run_validation)(seed=i, penalty_factor=PENALTY_FACTOR) for i in range(N_SIMS)
     )
     
@@ -325,3 +336,14 @@ if __name__ == "__main__":
     
     plt.tight_layout()
     plt.show()
+
+
+
+"""
+============================================================
+Param    True   Mean Est   Mean SE    Emp SD     Coverage  
+------------------------------------------------------------
+Beta     2.5    2.4980     0.0111     0.0111     95.10%    
+Gamma    1.0    0.9998     0.0052     0.0052     94.50%    
+============================================================
+"""
