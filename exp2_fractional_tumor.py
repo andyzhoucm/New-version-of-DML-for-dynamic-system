@@ -15,18 +15,6 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ==========================================
-# 0. 魔法工具：无模型底噪提取器
-# ==========================================
-def estimate_noise_variance(Y_obs):
-    """
-    利用二阶差分从连续轨迹中提取测量白噪音的方差。
-    假设局部轨迹近似线性，二阶差分的方差近似为 6 * sigma^2
-    """
-    diff2 = Y_obs[:, 2:, :] - 2 * Y_obs[:, 1:-1, :] + Y_obs[:, :-2, :]
-    return np.mean(diff2**2) / 6.0
-
-
-# ==========================================
 # 1. 物理引擎: 分数阶肿瘤生长模型 (Fractional Tumor Growth)
 # ==========================================
 class TumorPhysicsEngine:
