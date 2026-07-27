@@ -1,8 +1,3 @@
-"""
-Global 多病人版 + 跨病人 2-Fold DML + 专属时序编码器(IOB/COB) + 逐病患评估渲染
-(残差网络完全视野开放版 - 验证 Causal Smuggling 对照组)
-"""
-
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -34,8 +29,7 @@ DATA_DIR = '/root/code/data/2018'
 PATIENT_IDS = ['559', '563', '570', '575', '588', '591']
 
 # 全局核心消融开关
-USE_MSE = True          
-USE_CAUSAL_LOSS = False  
+USE_MSE = True            
 USE_DML = False               
 FREEZE_PKPD = False      
 
@@ -49,7 +43,7 @@ MAX_HIST = 47
 
 BATCH_SIZE = 64         
 NUM_WORKERS = 16 
-OUTER_EPOCHS = 10       
+OUTER_EPOCHS = 8       
 INNER_N_EPOCHS = 6      
 INNER_P_EPOCHS = 1      
 
@@ -411,18 +405,17 @@ class ResidualNN(nn.Module):
 
 # 🌟 核心修改 1: 将隐藏状态网络的输入扩展，重新允许观察 u_t 和 d_t
 class HiddenDynamicsNN(nn.Module):
-    def __init__(self, h_dim=C_DIM, y_dim=1, z_dim=2, hidden_dim=128, num_blocks=4):
+    # 去掉 z_dim
+    def __init__(self, h_dim=C_DIM, y_dim=1, hidden_dim=128, num_blocks=4):
         super().__init__()
-        # 将 z_dim=2 (碳水和胰岛素) 重新加回投影层中
-        self.proj_in = nn.Linear(h_dim + y_dim + z_dim, hidden_dim)
+        self.proj_in = nn.Linear(h_dim + y_dim, hidden_dim) # 不再拼接 z_dim
         self.res_blocks = nn.Sequential(*[AdvancedSmoothResBlock(hidden_dim) for _ in range(num_blocks)])
         self.proj_out = nn.Linear(hidden_dim, h_dim)
         nn.init.zeros_(self.proj_out.weight)
         nn.init.zeros_(self.proj_out.bias)
         
-    def forward(self, h, Y, u_t, d_t):
-        # 显式拼接外部干预向量
-        return -0.1 * h + self.proj_out(self.res_blocks(F.silu(self.proj_in(torch.cat([h, Y, u_t, d_t], dim=-1)))))
+    def forward(self, h, Y): # 删掉 u_t, d_t 输入
+        return -0.1 * h + self.proj_out(self.res_blocks(F.silu(self.proj_in(torch.cat([h, Y], dim=-1)))))
 
 class NuisanceNN(nn.Module):
     def __init__(self, in_dim, out_dim, hidden_dim=512, num_blocks=4, dropout=0.2):
@@ -463,8 +456,8 @@ class HybridAdditiveODEFunc(nn.Module):
         
         dy_phys = self.phys_C(Y, d_t, C_and_T_carb) + self.phys_I(Y, u_t, C_and_T_ins)
         
-        # 🌟 核心修改 2: 在计算隐状态导数时，将 u_t 和 d_t 传入黑盒网络
-        dh_g_dt = self.hidden_dyn(h_g, Y, u_t, d_t)
+        # 🌟 彻底蒙上黑盒的眼睛，它现在只能看到 h_g 和 Y
+        dh_g_dt = self.hidden_dyn(h_g, Y) 
         
         dy_dt = dy_phys + self.res_nn(torch.cat([h_g, time_t], dim=-1)) if self.use_nn else dy_phys
         return torch.cat([dy_dt, dh_g_dt], dim=-1)
@@ -568,7 +561,7 @@ def train_3step_alternating_loop(dl_f1, dl_f2, dl_tr_all, dl_te_all, phys_C, phy
             tau_i = pkpd_ins.min_tau + (pkpd_ins.max_tau - pkpd_ins.min_tau) * torch.sigmoid(pkpd_ins.raw_tau).item()
         print(f"    [Tau Tracker] 碳水 Tau: {tau_c:.3f} | 胰岛素 Tau: {tau_i:.3f}")
 
-        target_causal_ratio = 0.5 * (outer_ep / (OUTER_EPOCHS - 1)) if (outer_ep >= 1 and USE_DML) else 0.0 
+        target_causal_ratio = 1 
         
         # 1. N-Step
         if USE_DML:
@@ -622,7 +615,7 @@ def train_3step_alternating_loop(dl_f1, dl_f2, dl_tr_all, dl_te_all, phys_C, phy
                 m.eval()
                 for p in m.parameters(): p.requires_grad = False
                 
-        ep_f_mse, ep_score_C, ep_score_I, batches_f = 0.0, 0.0, 0.0, 0
+        ep_f_mse, ep_score_C, ep_score_I, batches_f, ep_dot_product = 0.0, 0.0, 0.0, 0, 0
         for fold_name, dl, q_C_oos, H_C_oos, q_I_oos, H_I_oos in [("Fold 1", dl_f1, n_q2_C, n_H2_C, n_q2_I, n_H2_I), ("Fold 2", dl_f2, n_q1_C, n_H1_C, n_q1_I, n_H1_I)]:
             for batch_Y, batch_U_raw, batch_D_raw, batch_Z_snap, batch_T_seq in tqdm(dl, desc=f"M-Step {fold_name}", leave=False):
                 batch_Y, batch_U_raw, batch_D_raw, batch_Z_snap, batch_T_seq = [x.to(DEVICE) for x in (batch_Y, batch_U_raw, batch_D_raw, batch_Z_snap, batch_T_seq)]
@@ -648,10 +641,14 @@ def train_3step_alternating_loop(dl_f1, dl_f2, dl_tr_all, dl_te_all, phys_C, phy
                         Z_C = torch.cat([pred_S_cl[:, :-1, 1:], h0_ins[:, :-1, :], batch_Y[:, :-1, :], batch_U[:, :-1, :], batch_T_seq[:, :-1, :]], dim=-1).reshape(-1, C_DIM + MEM_DIM + 4)
                         Z_I = torch.cat([pred_S_cl[:, :-1, 1:], h0_carb[:, :-1, :], batch_Y[:, :-1, :], batch_D[:, :-1, :], batch_T_seq[:, :-1, :]], dim=-1).reshape(-1, C_DIM + MEM_DIM + 4)
                         
+                    # 计算 Psi_C 和 Psi_I (保持你的原代码不变)
                     Psi_C = torch.einsum('ntdp,ntd->p', (J_C - H_C_oos(Z_C).reshape(-1, T_pts-1, Dim, P_C_total)), (batch_Y[:, 1:, :] - batch_Y[:, :-1, :] - F_C - q_C_oos(Z_C).reshape(-1, T_pts-1, Dim))) / (batch_Y.size(0) * (T_pts-1))
                     Psi_I = torch.einsum('ntdp,ntd->p', (J_I - H_I_oos(Z_I).reshape(-1, T_pts-1, Dim, P_I_total)), (batch_Y[:, 1:, :] - batch_Y[:, :-1, :] - F_I - q_I_oos(Z_I).reshape(-1, T_pts-1, Dim))) / (batch_Y.size(0) * (T_pts-1))
                     
                     if target_causal_ratio > 0:
+                        # ==========================================
+                        # 1. 碳水网络 (Carbs) 的因果梯度投影
+                        # ==========================================
                         scaled_Psi_C = -Psi_C * target_causal_ratio
                         pointer = 0
                         for param in phys_C.parameters():
@@ -659,19 +656,50 @@ def train_3step_alternating_loop(dl_f1, dl_f2, dl_tr_all, dl_te_all, phys_C, phy
                             g_dml = scaled_Psi_C[pointer : pointer + num_p].view_as(param)
                             
                             if param.grad is not None:
-                                param.grad += g_dml 
-                            
+                                g_mse = param.grad.clone()
+                                
+                                # 🌟 Causal PCGrad 核心逻辑 🌟
+                                # 检查 MSE 梯度是否在和 DML 梯度作对
+                                dot_product = torch.sum(g_mse * g_dml) 
+                                ep_dot_product += (dot_product / (torch.norm(g_mse) * torch.norm(g_dml) + 1e-8)).item()
+                                if dot_product < 0:
+                                    # 如果在作对，抹除 MSE 在 DML 逆方向上的分量
+                                    g_mse = g_mse - (dot_product / (torch.sum(g_dml * g_dml) + 1e-8)) * g_dml
+                                
+                                # 范数对齐：保证 DML 有足够的驱动力
+                                norm_mse = torch.norm(g_mse) + 1e-8
+                                norm_dml = torch.norm(g_dml) + 1e-8
+                                g_dml_aligned = g_dml * (norm_mse / norm_dml)
+                                
+                                # 最终注入：此时的 g_mse 已经绝对服从 g_dml 的方向
+                                param.grad = g_mse + g_dml_aligned 
+                                
                             pointer += num_p
-                        
-                        scaled_Psi_I = -Psi_I * target_causal_ratio * 2.0 
+
+                        # ==========================================
+                        # 2. 胰岛素网络 (Insulin) 的因果梯度投影
+                        # ==========================================
+                        scaled_Psi_I = -Psi_I * target_causal_ratio 
                         pointer = 0
                         for param in phys_I.parameters():
                             num_p = param.numel()
                             g_dml = scaled_Psi_I[pointer : pointer + num_p].view_as(param)
                             
                             if param.grad is not None:
-                                param.grad += g_dml
-                            
+                                g_mse = param.grad.clone()
+                                
+                                # 🌟 Causal PCGrad 核心逻辑 🌟
+                                dot_product = torch.sum(g_mse * g_dml) 
+                                ep_dot_product += (dot_product / (torch.norm(g_mse) * torch.norm(g_dml) + 1e-8)).item()
+                                if dot_product < 0:
+                                    g_mse = g_mse - (dot_product / (torch.sum(g_dml * g_dml) + 1e-8)) * g_dml
+                                
+                                norm_mse = torch.norm(g_mse) + 1e-8
+                                norm_dml = torch.norm(g_dml) + 1e-8
+                                g_dml_aligned = g_dml * (norm_mse / norm_dml)
+                                
+                                param.grad = g_mse + g_dml_aligned
+                                
                             pointer += num_p
                             
                     ep_score_C += torch.mean(torch.abs(Psi_C)).item() 
@@ -682,7 +710,7 @@ def train_3step_alternating_loop(dl_f1, dl_f2, dl_tr_all, dl_te_all, phys_C, phy
                 opt_f.step()
                 ep_f_mse += loss_mse.item(); batches_f += 1
                 
-        print(f"    [M-Step] MSE: {ep_f_mse/batches_f:.4f} | True Grad (C): {ep_score_C/batches_f:.2e} | True Grad (I): {ep_score_I/batches_f:.2e}")
+        print(f"    [M-Step] MSE: {ep_f_mse/batches_f:.4f} | True Grad (C): {ep_score_C/batches_f:.2e} | True Grad (I): {ep_score_I/batches_f:.2e} | Causal Dot Product: {ep_dot_product/batches_f:.2e}")
 
         # 3. R-Step
         for m in [enc_g, res_nn, hidden_dyn_nn]:
@@ -714,8 +742,8 @@ def train_3step_alternating_loop(dl_f1, dl_f2, dl_tr_all, dl_te_all, phys_C, phy
                 ep_r_mse += loss_r.item(); batches_r += 1
         print(f"    [R-Step] Avg MSE: {ep_r_mse/batches_r:.4f}")
 
-        evaluate_final_test_rmse(phys_C, phys_I, enc_g, enc_carb, enc_ins, res_nn, hidden_dyn_nn, 
-                                 pkpd_carb, pkpd_ins, dl_te_all, t_eval_t, label=f"Epoch {outer_ep+1} 20% TEST", subset_ratio=0.2)
+        # evaluate_final_test_rmse(phys_C, phys_I, enc_g, enc_carb, enc_ins, res_nn, hidden_dyn_nn, 
+        #                          pkpd_carb, pkpd_ins, dl_te_all, t_eval_t, label=f"Epoch {outer_ep+1} 20% TEST", subset_ratio=0.2)
 
     print("\n================================================")
     print(">>> 训练结束，开始执行全量测试集终极评估 (100%) <<<")
@@ -848,7 +876,7 @@ def main():
     phys_I = InsulinEffectNN(hidden_dim=8, mem_dim=MEM_DIM).to(DEVICE)
     
     res_nn = ResidualNN(in_dim=C_DIM+2, out_dim=1, hidden_dim=256, num_blocks=6).to(DEVICE)
-    hidden_dyn_nn = HiddenDynamicsNN(h_dim=C_DIM, y_dim=1, z_dim=2, hidden_dim=128, num_blocks=4).to(DEVICE)
+    hidden_dyn_nn = HiddenDynamicsNN(h_dim=C_DIM, y_dim=1, hidden_dim=128, num_blocks=4).to(DEVICE)
     
     dml_engine = DMLEngine(dt=DT_MINUTES / 60.0) 
     _, _, P_C_total = dml_engine.compute_integrals(phys_C, torch.zeros(2, T_pts, 1).to(DEVICE), torch.zeros(2, T_pts, 1).to(DEVICE), torch.zeros(2, T_pts, MEM_DIM + 2).to(DEVICE))
@@ -876,4 +904,395 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+"""
+random seed 43
+(my_env) root@cpod-1sc7ubm9xiqn:~/code# python /root/code/success.py
+🚀 Global 跨病人启动 | 包含 6 名患者 | MSE: True | DML: True | 冻结PKPD: False | Device: cuda
+>>> 1. 挂载 Global 数据并执行 [跨病人] 2-Fold 分割...
+    * Fold 1 包含病人: ['559', '563', '570']
+    * Fold 2 包含病人: ['575', '588', '591']
+
+>>> 2. 初始化网络...
+
+--- Outer Epoch [01/8] ---
+    [Tau Tracker] 碳水 Tau: 4.000 | 胰岛素 Tau: 12.000
+    [M-Step] MSE: 0.1538 | True Grad (C): 7.29e-04 | True Grad (I): 2.77e-04 | Causal Dot Product: 7.60e-01                                           
+    [R-Step] Avg MSE: 0.1493                                                                                                                          
+
+--- Outer Epoch [02/8] ---
+    [Tau Tracker] 碳水 Tau: 4.052 | 胰岛素 Tau: 12.159
+    [M-Step] MSE: 0.1287 | True Grad (C): 1.40e-04 | True Grad (I): 6.50e-04 | Causal Dot Product: 7.53e-01                                           
+    [R-Step] Avg MSE: 0.1230                                                                                                                          
+
+--- Outer Epoch [03/8] ---
+    [Tau Tracker] 碳水 Tau: 4.092 | 胰岛素 Tau: 12.278
+    [M-Step] MSE: 0.1199 | True Grad (C): 5.81e-05 | True Grad (I): 4.50e-04 | Causal Dot Product: 4.94e-01                                           
+    [R-Step] Avg MSE: 0.1264                                                                                                                          
+
+--- Outer Epoch [04/8] ---
+    [Tau Tracker] 碳水 Tau: 4.098 | 胰岛素 Tau: 12.355
+    [M-Step] MSE: 0.1238 | True Grad (C): 2.36e-05 | True Grad (I): 2.00e-04 | Causal Dot Product: 4.42e-01                                           
+    [R-Step] Avg MSE: 0.1234                                                                                                                          
+
+--- Outer Epoch [05/8] ---
+    [Tau Tracker] 碳水 Tau: 4.107 | 胰岛素 Tau: 12.355
+    [M-Step] MSE: 0.1256 | True Grad (C): 3.42e-05 | True Grad (I): 1.75e-04 | Causal Dot Product: -4.98e-01                                          
+    [R-Step] Avg MSE: 0.1293                                                                                                                          
+
+--- Outer Epoch [06/8] ---
+    [Tau Tracker] 碳水 Tau: 4.100 | 胰岛素 Tau: 12.348
+    [M-Step] MSE: 0.1300 | True Grad (C): 6.61e-06 | True Grad (I): 5.84e-05 | Causal Dot Product: 1.78e+00                                           
+    [R-Step] Avg MSE: 0.1303                                                                                                                          
+
+--- Outer Epoch [07/8] ---
+    [Tau Tracker] 碳水 Tau: 4.100 | 胰岛素 Tau: 12.352
+    [M-Step] MSE: 0.1220 | True Grad (C): 3.42e-05 | True Grad (I): 9.05e-05 | Causal Dot Product: -3.41e-01                                          
+    [R-Step] Avg MSE: 0.1263                                                                                                                          
+
+--- Outer Epoch [08/8] ---
+    [Tau Tracker] 碳水 Tau: 4.100 | 胰岛素 Tau: 12.360
+    [M-Step] MSE: 0.1287 | True Grad (C): 5.54e-05 | True Grad (I): 8.66e-05 | Causal Dot Product: -1.67e+00                                          
+    [R-Step] Avg MSE: 0.1254                                                                                                                          
+
+================================================
+>>> 训练结束，开始执行全量测试集终极评估 (100%) <<<
+================================================
+  | FINAL GLOBAL TEST | 样本数: 14562 | 30min: 19.04 | 60min: 31.87 | 120min: 46.90 |
+  | >> Causal Loss (C): 0.1356 | Causal Loss (I): 0.0461 <<
+
+  --> 所有病人的评估图表将保存在: /root/code/image/global_run_20260724_114118
+      正在绘制病人 559 的预测验证图...
+      正在绘制病人 563 的预测验证图...
+      正在绘制病人 570 的预测验证图...
+      正在绘制病人 575 的预测验证图...
+      正在绘制病人 588 的预测验证图...
+      正在绘制病人 591 的预测验证图...
+
+✅ Global 跨病人实验结束。
+(my_env) root@cpod-1sc7ubm9xiqn:~/code# python /root/code/success.py
+🚀 Global 跨病人启动 | 包含 6 名患者 | MSE: True | DML: False | 冻结PKPD: False | Device: cuda
+>>> 1. 挂载 Global 数据并执行 [跨病人] 2-Fold 分割...
+    * Fold 1 包含病人: ['559', '563', '570']
+    * Fold 2 包含病人: ['575', '588', '591']
+
+>>> 2. 初始化网络...
+
+--- Outer Epoch [01/8] ---
+    [Tau Tracker] 碳水 Tau: 4.000 | 胰岛素 Tau: 12.000
+    [M-Step] MSE: 0.1535 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1457                                                                                                                          
+
+--- Outer Epoch [02/8] ---
+    [Tau Tracker] 碳水 Tau: 4.051 | 胰岛素 Tau: 12.158
+    [M-Step] MSE: 0.1355 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1260                                                                                                                          
+
+--- Outer Epoch [03/8] ---
+    [Tau Tracker] 碳水 Tau: 4.118 | 胰岛素 Tau: 12.276
+    [M-Step] MSE: 0.1194 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1216                                                                                                                          
+
+--- Outer Epoch [04/8] ---
+    [Tau Tracker] 碳水 Tau: 4.164 | 胰岛素 Tau: 12.361
+    [M-Step] MSE: 0.1165 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1247                                                                                                                          
+
+--- Outer Epoch [05/8] ---
+    [Tau Tracker] 碳水 Tau: 4.203 | 胰岛素 Tau: 12.405
+    [M-Step] MSE: 0.1213 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1227                                                                                                                          
+
+--- Outer Epoch [06/8] ---
+    [Tau Tracker] 碳水 Tau: 4.210 | 胰岛素 Tau: 12.397
+    [M-Step] MSE: 0.1222 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1191                                                                                                                          
+
+--- Outer Epoch [07/8] ---
+    [Tau Tracker] 碳水 Tau: 4.211 | 胰岛素 Tau: 12.407
+    [M-Step] MSE: 0.1154 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1177                                                                                                                          
+
+--- Outer Epoch [08/8] ---
+    [Tau Tracker] 碳水 Tau: 4.211 | 胰岛素 Tau: 12.419
+    [M-Step] MSE: 0.1181 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1201                                                                                                                          
+
+================================================
+>>> 训练结束，开始执行全量测试集终极评估 (100%) <<<
+================================================
+  | FINAL GLOBAL TEST | 样本数: 14562 | 30min: 19.39 | 60min: 32.47 | 120min: 49.36 |
+  | >> Causal Loss (C): 0.0000 | Causal Loss (I): 15.9060 <<
+
+  --> 所有病人的评估图表将保存在: /root/code/image/global_run_20260724_120648
+      正在绘制病人 559 的预测验证图...
+      正在绘制病人 563 的预测验证图...
+      正在绘制病人 570 的预测验证图...
+      正在绘制病人 575 的预测验证图...
+      正在绘制病人 588 的预测验证图...
+      正在绘制病人 591 的预测验证图...
+
+✅ Global 跨病人实验结束。
+
+random seed 42
+
+(my_env) root@cpod-1sc7ubm9xiqn:~/code# python /root/code/success.py
+🚀 Global 跨病人启动 | 包含 6 名患者 | MSE: True | DML: False | 冻结PKPD: False | Device: cuda
+>>> 1. 挂载 Global 数据并执行 [跨病人] 2-Fold 分割...
+    * Fold 1 包含病人: ['559', '563', '570']
+    * Fold 2 包含病人: ['575', '588', '591']
+
+>>> 2. 初始化网络...
+
+--- Outer Epoch [01/8] ---
+    [Tau Tracker] 碳水 Tau: 4.000 | 胰岛素 Tau: 12.000
+    [M-Step] MSE: 0.1564 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1442                                                                                                                          
+
+--- Outer Epoch [02/8] ---
+    [Tau Tracker] 碳水 Tau: 4.067 | 胰岛素 Tau: 12.159
+    [M-Step] MSE: 0.1294 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1275                                                                                                                          
+
+--- Outer Epoch [03/8] ---
+    [Tau Tracker] 碳水 Tau: 4.099 | 胰岛素 Tau: 12.217
+    [M-Step] MSE: 0.1214 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1211                                                                                                                          
+
+--- Outer Epoch [04/8] ---
+    [Tau Tracker] 碳水 Tau: 4.100 | 胰岛素 Tau: 12.219
+    [M-Step] MSE: 0.1180 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1204                                                                                                                          
+
+--- Outer Epoch [05/8] ---
+    [Tau Tracker] 碳水 Tau: 4.101 | 胰岛素 Tau: 12.220
+    [M-Step] MSE: 0.1229 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1203                                                                                                                          
+
+--- Outer Epoch [06/8] ---
+    [Tau Tracker] 碳水 Tau: 4.107 | 胰岛素 Tau: 12.221
+    [M-Step] MSE: 0.1330 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1249                                                                                                                          
+
+--- Outer Epoch [07/8] ---
+    [Tau Tracker] 碳水 Tau: 4.090 | 胰岛素 Tau: 12.250
+    [M-Step] MSE: 0.1226 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1203                                                                                                                          
+
+--- Outer Epoch [08/8] ---
+    [Tau Tracker] 碳水 Tau: 4.090 | 胰岛素 Tau: 12.256
+    [M-Step] MSE: 0.1180 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1189                                                                                                                          
+
+================================================
+>>> 训练结束，开始执行全量测试集终极评估 (100%) <<<
+================================================
+  | FINAL GLOBAL TEST | 样本数: 14562 | 30min: 19.16 | 60min: 31.95 | 120min: 46.06 |
+  | >> Causal Loss (C): 0.0046 | Causal Loss (I): 6.9209 <<
+
+  --> 所有病人的评估图表将保存在: /root/code/image/global_run_20260724_125243
+      正在绘制病人 559 的预测验证图...
+      正在绘制病人 563 的预测验证图...
+      正在绘制病人 570 的预测验证图...
+      正在绘制病人 575 的预测验证图...
+      正在绘制病人 588 的预测验证图...
+      正在绘制病人 591 的预测验证图...
+
+✅ Global 跨病人实验结束。
+
+(my_env) root@cpod-1sc7ubm9xiqn:~/code# python /root/code/success.py
+🚀 Global 跨病人启动 | 包含 6 名患者 | MSE: True | DML: True | 冻结PKPD: False | Device: cuda
+>>> 1. 挂载 Global 数据并执行 [跨病人] 2-Fold 分割...
+    * Fold 1 包含病人: ['559', '563', '570']
+    * Fold 2 包含病人: ['575', '588', '591']
+
+>>> 2. 初始化网络...
+
+--- Outer Epoch [01/8] ---
+    [Tau Tracker] 碳水 Tau: 4.000 | 胰岛素 Tau: 12.000
+    [M-Step] MSE: 0.1551 | True Grad (C): 3.19e-04 | True Grad (I): 7.61e-04 | Causal Dot Product: 8.77e-01                                           
+    [R-Step] Avg MSE: 0.1474                                                                                                                          
+
+--- Outer Epoch [02/8] ---
+    [Tau Tracker] 碳水 Tau: 4.064 | 胰岛素 Tau: 12.164
+    [M-Step] MSE: 0.1275 | True Grad (C): 1.10e-04 | True Grad (I): 1.09e-04 | Causal Dot Product: 4.47e-01                                           
+    [R-Step] Avg MSE: 0.2198                                                                                                                          
+
+--- Outer Epoch [03/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.167
+    [M-Step] MSE: 0.1397 | True Grad (C): 8.94e-06 | True Grad (I): 6.71e-05 | Causal Dot Product: 2.10e+00                                           
+    [R-Step] Avg MSE: 0.1377                                                                                                                          
+
+--- Outer Epoch [04/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.176
+    [M-Step] MSE: 0.1335 | True Grad (C): 2.34e-05 | True Grad (I): 3.20e-05 | Causal Dot Product: 1.07e+00                                           
+    [R-Step] Avg MSE: 0.1294                                                                                                                          
+
+--- Outer Epoch [05/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.176
+    [M-Step] MSE: 0.1242 | True Grad (C): 1.37e-05 | True Grad (I): 3.75e-05 | Causal Dot Product: 2.42e+00                                           
+    [R-Step] Avg MSE: 0.1254                                                                                                                          
+
+--- Outer Epoch [06/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.176
+    [M-Step] MSE: 0.1227 | True Grad (C): 1.58e-05 | True Grad (I): 8.80e-05 | Causal Dot Product: -3.56e-01                                          
+    [R-Step] Avg MSE: 0.1218                                                                                                                          
+
+--- Outer Epoch [07/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.176
+    [M-Step] MSE: 0.1187 | True Grad (C): 1.12e-05 | True Grad (I): 4.37e-05 | Causal Dot Product: 2.28e+00                                           
+    [R-Step] Avg MSE: 0.1191                                                                                                                          
+
+--- Outer Epoch [08/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.176
+    [M-Step] MSE: 0.1190 | True Grad (C): 9.01e-06 | True Grad (I): 1.44e-05 | Causal Dot Product: 1.49e+00                                           
+    [R-Step] Avg MSE: 0.1185                                                                                                                          
+
+================================================
+>>> 训练结束，开始执行全量测试集终极评估 (100%) <<<
+================================================
+  | FINAL GLOBAL TEST | 样本数: 14562 | 30min: 19.40 | 60min: 32.67 | 120min: 48.78 |
+  | >> Causal Loss (C): 0.9786 | Causal Loss (I): 1.0212 <<
+
+  --> 所有病人的评估图表将保存在: /root/code/image/global_run_20260724_133810
+      正在绘制病人 559 的预测验证图...
+      正在绘制病人 563 的预测验证图...
+      正在绘制病人 570 的预测验证图...
+      正在绘制病人 575 的预测验证图...
+      正在绘制病人 588 的预测验证图...
+      正在绘制病人 591 的预测验证图...
+
+✅ Global 跨病人实验结束。
+
+random seed 44
+
+(my_env) root@cpod-1sc7ubm9xiqn:~/code# python /root/code/success.py
+🚀 Global 跨病人启动 | 包含 6 名患者 | MSE: True | DML: True | 冻结PKPD: False | Device: cuda
+>>> 1. 挂载 Global 数据并执行 [跨病人] 2-Fold 分割...
+    * Fold 1 包含病人: ['559', '563', '570']
+    * Fold 2 包含病人: ['575', '588', '591']
+
+>>> 2. 初始化网络...
+
+--- Outer Epoch [01/8] ---
+    [Tau Tracker] 碳水 Tau: 4.000 | 胰岛素 Tau: 12.000
+    [M-Step] MSE: 0.1551 | True Grad (C): 3.19e-04 | True Grad (I): 7.61e-04 | Causal Dot Product: 8.77e-01                                           
+    [R-Step] Avg MSE: 0.1474                                                                                                                          
+
+--- Outer Epoch [02/8] ---
+    [Tau Tracker] 碳水 Tau: 4.064 | 胰岛素 Tau: 12.164
+    [M-Step] MSE: 0.1275 | True Grad (C): 1.10e-04 | True Grad (I): 1.09e-04 | Causal Dot Product: 4.47e-01                                           
+    [R-Step] Avg MSE: 0.2198                                                                                                                          
+
+--- Outer Epoch [03/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.167
+    [M-Step] MSE: 0.1397 | True Grad (C): 8.94e-06 | True Grad (I): 6.71e-05 | Causal Dot Product: 2.10e+00                                           
+    [R-Step] Avg MSE: 0.1377                                                                                                                          
+
+--- Outer Epoch [04/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.176
+    [M-Step] MSE: 0.1335 | True Grad (C): 2.34e-05 | True Grad (I): 3.20e-05 | Causal Dot Product: 1.07e+00                                           
+    [R-Step] Avg MSE: 0.1294                                                                                                                          
+
+--- Outer Epoch [05/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.176
+    [M-Step] MSE: 0.1242 | True Grad (C): 1.37e-05 | True Grad (I): 3.75e-05 | Causal Dot Product: 2.42e+00                                           
+    [R-Step] Avg MSE: 0.1254                                                                                                                          
+
+--- Outer Epoch [06/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.176
+    [M-Step] MSE: 0.1227 | True Grad (C): 1.58e-05 | True Grad (I): 8.80e-05 | Causal Dot Product: -3.56e-01                                          
+    [R-Step] Avg MSE: 0.1218                                                                                                                          
+
+--- Outer Epoch [07/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.176
+    [M-Step] MSE: 0.1187 | True Grad (C): 1.12e-05 | True Grad (I): 4.37e-05 | Causal Dot Product: 2.28e+00                                           
+    [R-Step] Avg MSE: 0.1191                                                                                                                          
+
+--- Outer Epoch [08/8] ---
+    [Tau Tracker] 碳水 Tau: 4.075 | 胰岛素 Tau: 12.176
+    [M-Step] MSE: 0.1190 | True Grad (C): 9.01e-06 | True Grad (I): 1.44e-05 | Causal Dot Product: 1.49e+00                                           
+    [R-Step] Avg MSE: 0.1185                                                                                                                          
+
+================================================
+>>> 训练结束，开始执行全量测试集终极评估 (100%) <<<
+================================================
+  | FINAL GLOBAL TEST | 样本数: 14562 | 30min: 19.40 | 60min: 32.67 | 120min: 48.78 |
+  | >> Causal Loss (C): 0.9786 | Causal Loss (I): 1.0212 <<
+
+  --> 所有病人的评估图表将保存在: /root/code/image/global_run_20260724_140614
+      正在绘制病人 559 的预测验证图...
+      正在绘制病人 563 的预测验证图...
+      正在绘制病人 570 的预测验证图...
+      正在绘制病人 575 的预测验证图...
+      正在绘制病人 588 的预测验证图...
+      正在绘制病人 591 的预测验证图...
+
+✅ Global 跨病人实验结束。
+
+(my_env) root@cpod-1sc7ubm9xiqn:~/code# python /root/code/success.py
+🚀 Global 跨病人启动 | 包含 6 名患者 | MSE: True | DML: False | 冻结PKPD: False | Device: cuda
+>>> 1. 挂载 Global 数据并执行 [跨病人] 2-Fold 分割...
+    * Fold 1 包含病人: ['559', '563', '570']
+    * Fold 2 包含病人: ['575', '588', '591']
+
+>>> 2. 初始化网络...
+
+--- Outer Epoch [01/8] ---
+    [Tau Tracker] 碳水 Tau: 4.000 | 胰岛素 Tau: 12.000
+    [M-Step] MSE: 0.1564 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1442                                                                                                                          
+
+--- Outer Epoch [02/8] ---
+    [Tau Tracker] 碳水 Tau: 4.067 | 胰岛素 Tau: 12.159
+    [M-Step] MSE: 0.1294 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1275                                                                                                                          
+
+--- Outer Epoch [03/8] ---
+    [Tau Tracker] 碳水 Tau: 4.099 | 胰岛素 Tau: 12.217
+    [M-Step] MSE: 0.1214 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1211                                                                                                                          
+
+--- Outer Epoch [04/8] ---
+    [Tau Tracker] 碳水 Tau: 4.100 | 胰岛素 Tau: 12.219
+    [M-Step] MSE: 0.1180 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1204                                                                                                                          
+
+--- Outer Epoch [05/8] ---
+    [Tau Tracker] 碳水 Tau: 4.101 | 胰岛素 Tau: 12.220
+    [M-Step] MSE: 0.1229 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1203                                                                                                                          
+
+--- Outer Epoch [06/8] ---
+    [Tau Tracker] 碳水 Tau: 4.107 | 胰岛素 Tau: 12.221
+    [M-Step] MSE: 0.1330 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1249                                                                                                                          
+
+--- Outer Epoch [07/8] ---
+    [Tau Tracker] 碳水 Tau: 4.090 | 胰岛素 Tau: 12.250
+    [M-Step] MSE: 0.1226 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1203                                                                                                                          
+
+--- Outer Epoch [08/8] ---
+    [Tau Tracker] 碳水 Tau: 4.090 | 胰岛素 Tau: 12.256
+    [M-Step] MSE: 0.1180 | True Grad (C): 0.00e+00 | True Grad (I): 0.00e+00 | Causal Dot Product: 0.00e+00                                           
+    [R-Step] Avg MSE: 0.1189                                                                                                                          
+
+================================================
+>>> 训练结束，开始执行全量测试集终极评估 (100%) <<<
+================================================
+  | FINAL GLOBAL TEST | 样本数: 14562 | 30min: 19.16 | 60min: 31.95 | 120min: 46.06 |
+  | >> Causal Loss (C): 0.0046 | Causal Loss (I): 6.9209 <<
+
+  --> 所有病人的评估图表将保存在: /root/code/image/global_run_20260724_143612
+      正在绘制病人 559 的预测验证图...
+      正在绘制病人 563 的预测验证图...
+      正在绘制病人 570 的预测验证图...
+      正在绘制病人 575 的预测验证图...
+      正在绘制病人 588 的预测验证图...
+      正在绘制病人 591 的预测验证图...
+
+✅ Global 跨病人实验结束。
+
+"""
 
